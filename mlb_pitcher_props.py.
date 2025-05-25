@@ -1,0 +1,165 @@
+# 📦 Install required packages (if not already installed)
+!pip install requests pandas --quiet
+
+# 📚 Import libraries
+import requests
+import pandas as pd
+from datetime import datetime
+import time
+
+# 🔑 API keys and base URLs
+MLB_API_BASE = 'https://statsapi.mlb.com/api/v1'
+
+# 🔍 Get today's MLB games with probable pitchers
+def get_today_pitchers():
+    today = datetime.today().strftime('%Y-%m-%d')
+    url = f"{MLB_API_BASE}/schedule?sportId=1&date={today}&hydrate=team,linescore,probablePitcher"
+    res = requests.get(url)
+    data = res.json()
+
+    games = data.get('dates', [])
+    if not games:
+        return []
+
+    pitchers = []
+    for game in games[0]['games']:
+        try:
+            pitcher = game['teams']['away']['probablePitcher']
+            team = game['teams']['away']['team']['name']
+            opponent = game['teams']['home']['team']['name']
+            pitchers.append({'id': pitcher['id'], 'team': team, 'opponent': opponent})
+        except:
+            pass
+        try:
+            pitcher = game['teams']['home']['probablePitcher']
+            team = game['teams']['home']['team']['name']
+            opponent = game['teams']['away']['team']['name']
+            pitchers.append({'id': pitcher['id'], 'team': team, 'opponent': opponent})
+        except:
+            pass
+    return pitchers
+
+# 🧠 Get pitcher stats from MLB API
+def get_pitcher_stats(pitcher_id):
+    url = f"{MLB_API_BASE}/people/{pitcher_id}/stats?stats=season&group=pitching"
+    res = requests.get(url)
+    data = res.json()
+    stats_array = data.get('stats', [])
+    if not stats_array:
+        return None
+    stats = stats_array[0].get('splits', [])
+    if not stats:
+        return None
+
+    season_data = stats[0]['stat']
+    name = stats[0]['player']['fullName']
+    return {
+        'Name': name,
+        'ERA': float(season_data.get('era', 0)),
+        'WHIP': float(season_data.get('whip', 0)),
+        'Strikeouts': int(season_data.get('strikeOuts', 0)),
+        'Games Started': int(season_data.get('gamesStarted', 1)),
+        'Hits': int(season_data.get('hits', 0)),
+        'Innings Pitched': float(season_data.get('inningsPitched', 1))
+    }
+
+# ➕ Scoring function to determine best prop and confidence score
+def score_props(stats):
+    # MLB rough averages (adjust as you see fit)
+    avg_k_per_start = 6.0
+    avg_hits_per_ip = 1.1
+    avg_era = 4.0
+    avg_whip = 1.25
+    avg_outs_per_game = 21  # roughly 7 innings * 3 outs
+
+    scores = {}
+
+    # Strikeouts prop score (higher K/start = stronger Over)
+    k_score = (stats['K/Start'] - avg_k_per_start) / avg_k_per_start
+    scores['Over Strikeouts'] = max(k_score, 0)
+    scores['Under Strikeouts'] = max(-k_score, 0)
+
+    # Hits Allowed prop score (higher hits/ip = stronger Over)
+    hits_score = (stats['Hits/IP'] - avg_hits_per_ip) / avg_hits_per_ip
+    scores['Over Hits Allowed'] = max(hits_score, 0)
+    scores['Under Hits Allowed'] = max(-hits_score, 0)
+
+    # Earned Runs prop score (combine ERA and WHIP; lower is better for Under)
+    era_score = (avg_era - stats['ERA']) / avg_era
+    whip_score = (avg_whip - stats['WHIP']) / avg_whip
+    er_score = (era_score + whip_score) / 2
+    scores['Under Earned Runs'] = max(er_score, 0)
+    scores['Over Earned Runs'] = max(-er_score, 0)
+
+    # Pitching Outs score (approximate)
+    # Assume outs/game = innings pitched * 3, compare to average outs
+    outs_per_game = (stats['Innings Pitched'] * 3) / stats['Games Started']
+    outs_score = (outs_per_game - avg_outs_per_game) / avg_outs_per_game
+    scores['Over Pitching Outs'] = max(outs_score, 0)
+    scores['Under Pitching Outs'] = max(-outs_score, 0)
+
+    # Pick best prop (highest score)
+    best_prop = max(scores, key=scores.get)
+    confidence = scores[best_prop]
+
+    return best_prop, confidence
+
+# 🤖 Main analysis logic
+def analyze_pitchers():
+    pitchers = get_today_pitchers()
+    if not pitchers:
+        print("❌ No usable pitcher data found today.")
+        return pd.DataFrame()
+
+    data = []
+    for p in pitchers:
+        stats = get_pitcher_stats(p['id'])
+        if not stats:
+            continue
+        stats['Team'] = p['team']
+        stats['Opponent'] = p['opponent']
+        try:
+            stats['K/Start'] = round(stats['Strikeouts'] / stats['Games Started'], 2)
+        except ZeroDivisionError:
+            stats['K/Start'] = 0
+        try:
+            stats['Hits/IP'] = round(stats['Hits'] / stats['Innings Pitched'], 2)
+        except ZeroDivisionError:
+            stats['Hits/IP'] = 0
+
+        # Previous simple suggestion logic (optional, can keep or remove)
+        if stats['K/Start'] >= 6:
+            stats['Prop Suggestion'] = 'Over Strikeouts'
+        elif stats['K/Start'] <= 3.5:
+            stats['Prop Suggestion'] = 'Under Strikeouts'
+        elif stats['Hits/IP'] >= 1.3:
+            stats['Prop Suggestion'] = 'Over Hits Allowed'
+        elif stats['Hits/IP'] <= 0.85:
+            stats['Prop Suggestion'] = 'Under Hits Allowed'
+        elif stats['ERA'] <= 2.8 and stats['WHIP'] <= 1.05:
+            stats['Prop Suggestion'] = 'Under Earned Runs'
+        elif stats['ERA'] >= 5.0 and stats['WHIP'] >= 1.4:
+            stats['Prop Suggestion'] = 'Over Earned Runs'
+        else:
+            stats['Prop Suggestion'] = '⚠️ No Strong Prop'
+
+        # Use scoring function to get best prop + confidence
+        best_prop, confidence = score_props(stats)
+        stats['Best Prop'] = best_prop
+        stats['Confidence Score'] = round(confidence, 3)
+
+        data.append(stats)
+        time.sleep(0.5)
+
+    df = pd.DataFrame(data)
+    return df
+
+# 🔁 RUN THE ANALYSIS AND DISPLAY RESULTS
+if __name__ == "__main__":
+    df = analyze_pitchers()
+    pd.set_option('display.max_rows', None)
+
+    if not df.empty:
+        display(df[['Name', 'Team', 'Opponent', 'ERA', 'WHIP', 'K/Start', 'Hits/IP', 'Prop Suggestion', 'Best Prop', 'Confidence Score']])
+    else:
+        print("❌ No valid pitcher data available to display today. Check later or verify MLB API availability.")
